@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
+import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -172,6 +175,119 @@ def _same_profile(handle: Any, left: str, right: str) -> str:
 
 SUBSCRIPTION_ROUTE_PATTERNS = ("%subscription%",)
 _COST_TABLES = ("sessions", "session_model_usage")
+_APPROX_RATE_CACHE: Dict[Tuple[Any, ...], Tuple[Optional[Tuple[float, float, float, float]], str]] = {}
+_COPILOT_PROVIDERS = frozenset({"copilot", "github-copilot", "copilot-acp", "github-copilot-acp", "github-models", "github"})
+
+
+def _is_copilot_route(*values: Any) -> bool:
+    for value in values:
+        text = str(value or "").strip().lower()
+        if text in _COPILOT_PROVIDERS or "githubcopilot.com" in text or "models.github.ai" in text:
+            return True
+    return False
+
+
+def _copilot_pricing_mode(settings: Optional[Mapping[str, Any]] = None) -> str:
+    raw = (settings if isinstance(settings, Mapping) else _plugin_settings()).get("copilot_pricing_mode")
+    val = str(raw if raw is not None else "estimated").strip().lower()
+    return val if val in {"estimated", "subscription", "off"} else "estimated"
+
+
+def _approx_model_rates(model: Any, provider: Any = "", base_url: Any = "", settings: Optional[Mapping[str, Any]] = None) -> Tuple[Optional[Tuple[float, float, float, float]], str]:
+    settings = settings if isinstance(settings, Mapping) else _plugin_settings()
+    name = str(model or "").strip()
+    slug = name.split("/", 1)[-1].split("[", 1)[0]
+    overrides = settings.get("model_pricing_overrides") or {}
+    if isinstance(overrides, Mapping):
+        for exact in (name, slug):
+            value = overrides.get(exact)
+            if value is not None:
+                try:
+                    parts = [value.get(k, 0) for k in ("input", "output", "cache_read", "cache_write")] if isinstance(value, Mapping) else list(value)
+                    if 2 <= len(parts) <= 4:
+                        parts = (parts + [parts[0], parts[0]])[:4]
+                        return (float(parts[0]) / 1e6, float(parts[1]) / 1e6, float(parts[2]) / 1e6, float(parts[3]) / 1e6), "user_override"
+                except (TypeError, ValueError):
+                    pass
+        for pattern, value in overrides.items():
+            if fnmatch.fnmatchcase(name, str(pattern)) or fnmatch.fnmatchcase(slug, str(pattern)):
+                try:
+                    parts = [value.get(k, 0) for k in ("input", "output", "cache_read", "cache_write")] if isinstance(value, Mapping) else list(value)
+                    if 2 <= len(parts) <= 4:
+                        parts = (parts + [parts[0], parts[0]])[:4]
+                        return (float(parts[0]) / 1e6, float(parts[1]) / 1e6, float(parts[2]) / 1e6, float(parts[3]) / 1e6), "user_override"
+                except (TypeError, ValueError):
+                    pass
+    if not _is_copilot_route(provider, base_url) or _copilot_pricing_mode(settings) == "off":
+        return None, ""
+    snapshot = repr((_copilot_pricing_mode(settings), sorted((str(k), repr(v)) for k, v in overrides.items()) if isinstance(overrides, Mapping) else ()))
+    cache_key = (snapshot, name, str(provider or ""), str(base_url or ""))
+    if cache_key in _APPROX_RATE_CACHE:
+        return _APPROX_RATE_CACHE[cache_key]
+    rates = None
+    try:
+        from agent.usage_pricing import get_pricing_entry
+        candidates = [slug, re.sub(r"-\d{4}-\d{2}-\d{2}$", "", slug), re.sub(r"-\d+[km]$", "", slug, flags=re.I)]
+        if slug.lower().startswith("claude"):
+            candidates.append(re.sub(r"(\d)\.(\d)", r"\1-\2", slug))
+        vendor = "anthropic" if slug.lower().startswith("claude") else "google" if slug.lower().startswith("gemini") else "openai" if slug.lower().startswith(("gpt", "o1", "o3", "o4")) else "deepseek" if slug.lower().startswith("deepseek") else "xai" if slug.lower().startswith("grok") else None
+        for candidate in dict.fromkeys(candidates):
+            for provider_id in (vendor, None):
+                entry = get_pricing_entry(candidate, provider_id, None)
+                if entry is None or (getattr(entry, "source", "") == "none" and not getattr(entry, "input_cost_per_million", 0)):
+                    continue
+                inp = getattr(entry, "input_cost_per_million", None)
+                if inp is not None:
+                    rates = tuple(float(getattr(entry, attr, None) if getattr(entry, attr, None) is not None else inp) / 1e6 for attr in ("input_cost_per_million", "output_cost_per_million", "cache_read_cost_per_million", "cache_write_cost_per_million"))
+                    break
+            if rates:
+                break
+        if rates is None and slug.lower() in {"claude-haiku-5.5", "claude-haiku-5-5"}:
+            rates = (1e-6, 5e-6, .1e-6, 1.25e-6)
+    except Exception:
+        pass
+    result = (rates, "copilot_approx" if rates else "")
+    _APPROX_RATE_CACHE[cache_key] = result
+    return result
+
+
+def _register_pricing_functions(connection: Any) -> None:
+    import json
+
+    def resolve(model: Any, provider: Any, base_url: Any, settings_text: Any):
+        try:
+            settings = json.loads(settings_text or "{}")
+        except Exception:
+            settings = {}
+        rates, source = _approx_model_rates(model, provider, base_url, settings)
+        return settings, rates, source
+
+    def usd(model, provider, base_url, inp, out, cr, cw, settings_text):
+        _settings, rates, _source = resolve(model, provider, base_url, settings_text)
+        if rates is None:
+            return None
+        return round(sum(int(value or 0) * rate for value, rate in zip((inp, out, cr, cw), rates)), 6)
+
+    def mode(model, provider, base_url, settings_text):
+        settings, rates, source = resolve(model, provider, base_url, settings_text)
+        del rates
+        value = _copilot_pricing_mode(settings)
+        if source == "user_override" or (source == "copilot_approx" and value == "estimated"):
+            return "estimated"
+        if source == "copilot_approx" and value == "subscription":
+            return "included"
+        return ""
+
+    def source(model, provider, base_url, settings_text):
+        return resolve(model, provider, base_url, settings_text)[2] or ""
+
+    for name, nargs, function in (("session_lens_approx_usd", 8, usd),
+                                  ("session_lens_approx_mode", 4, mode),
+                                  ("session_lens_approx_source", 4, source)):
+        try:
+            connection.create_function(name, nargs, function, deterministic=True)
+        except TypeError:
+            connection.create_function(name, nargs, function)
 
 
 def _subscription_route_sql(present: Iterable[str]) -> str:
@@ -193,22 +309,43 @@ def _accounting_select_list(table: str, ordered: List[str], present: Iterable[st
     rewrite = table in _COST_TABLES
     route = _subscription_route_sql(present) if rewrite else "0"
     expressions = []
-    for column in ordered:
-        name = _quote_identifier(column)
-        if column not in present:
-            expressions.append(f"NULL AS {name}")
-        elif rewrite and column in ("estimated_cost_usd", "actual_cost_usd"):
-            expressions.append(f"CASE WHEN {route} THEN 0 ELSE {name} END AS {name}")
-        elif rewrite and column == "cost_status":
-            expressions.append(f"CASE WHEN {route} THEN 'included' ELSE {name} END AS {name}")
-        else:
-            expressions.append(name)
+    settings = _plugin_settings()
+    settings_text = json.dumps({"copilot_pricing_mode": _copilot_pricing_mode(settings), "model_pricing_overrides": settings.get("model_pricing_overrides") or {}}, separators=(",", ":"), sort_keys=True).replace("'", "''")
+    model = '"model"' if "model" in present else "NULL"
+    provider = '"billing_provider"' if "billing_provider" in present else "NULL"
+    base_url = '"billing_base_url"' if "billing_base_url" in present else "NULL"
+    token_cols = [('"input_tokens"' if "input_tokens" in present else "0"), ('"output_tokens"' if "output_tokens" in present else "0"), ('"cache_read_tokens"' if "cache_read_tokens" in present else "0"), ('"cache_write_tokens"' if "cache_write_tokens" in present else "0")]
+    call = f"{model}, {provider}, {base_url}"
+    mode_expr = f"session_lens_approx_mode({call}, '{settings_text}')"
+    src_expr = f"session_lens_approx_source({call}, '{settings_text}')"
+    usd_expr = f"session_lens_approx_usd({call}, {', '.join(token_cols)}, '{settings_text}')"
+    def col_or(column, fallback):
+        return f'coalesce("{column}", {fallback})' if column in present else fallback
+    status_sql = col_or("cost_status", "''")
+    unpriced_sql = f"({col_or('actual_cost_usd', '0')} <= 0 AND {col_or('estimated_cost_usd', '0')} <= 0 AND lower({status_sql}) IN ('', 'unknown'))"
     if rewrite:
         actual = '"actual_cost_usd"' if "actual_cost_usd" in present else "NULL"
         estimated = '"estimated_cost_usd"' if "estimated_cost_usd" in present else "NULL"
-        expressions.append(
-            f"CASE WHEN {route} THEN coalesce(nullif({actual},0), {estimated}) END AS \"list_price_usd\""
-        )
+        list_fallback = '"list_price_usd"' if "list_price_usd" in present else "NULL"
+        list_expr = f"CASE WHEN {route} THEN coalesce(nullif({actual},0), {estimated}) WHEN {unpriced_sql} AND {mode_expr} = 'included' THEN {usd_expr} ELSE {list_fallback} END AS \"list_price_usd\""
+    for column in ordered:
+        name = _quote_identifier(column)
+        if rewrite and column == "list_price_usd":
+            expressions.append(list_expr)
+        elif column not in present:
+            expressions.append(f"NULL AS {name}")
+        elif rewrite and column == "estimated_cost_usd":
+            expressions.append(f"CASE WHEN {route} THEN 0 WHEN {unpriced_sql} AND {mode_expr} = 'estimated' THEN coalesce({usd_expr}, {name}) WHEN {unpriced_sql} AND {mode_expr} = 'included' THEN 0 ELSE {name} END AS {name}")
+        elif rewrite and column == "actual_cost_usd":
+            expressions.append(f"CASE WHEN {route} THEN 0 WHEN {unpriced_sql} AND {mode_expr} = 'included' THEN 0 ELSE {name} END AS {name}")
+        elif rewrite and column == "cost_status":
+            expressions.append(f"CASE WHEN {route} THEN 'included' WHEN {unpriced_sql} AND {mode_expr} != '' THEN {mode_expr} ELSE {name} END AS {name}")
+        elif rewrite and column == "cost_source":
+            expressions.append(f"CASE WHEN {unpriced_sql} AND {src_expr} != '' THEN {src_expr} ELSE {name} END AS {name}")
+        else:
+            expressions.append(name)
+    if rewrite and "list_price_usd" not in ordered:
+        expressions.append(list_expr)
     return expressions
 
 
@@ -219,6 +356,7 @@ def _install_accounting_views(connection: Any) -> None:
     the raw tables in place (costs then read as Hermes recorded them)."""
     for table in _COST_TABLES:
         try:
+            _register_pricing_functions(connection)
             exists = connection.execute(
                 "SELECT 1 FROM sqlite_temp_master WHERE type='view' AND name=?", (table,)
             ).fetchone()
@@ -251,6 +389,7 @@ class _UnionDB:
         self.db_path = named_paths[0][1]
         self._conn = sqlite3.connect(f"file:{named_paths[0][1].as_posix()}?mode=ro", uri=True)
         self._conn.row_factory = sqlite3.Row
+        _register_pricing_functions(self._conn)
         aliases = ["main"]
         for index, (_name, path) in enumerate(named_paths[1:], start=1):
             alias = f"p{index}"
@@ -505,12 +644,13 @@ def _accounted_sessions_sql(connection: Any) -> str:
         columns = []
     if not columns:
         return "SELECT * FROM sessions"
-    has_usage = True
+    usage_cols = set()
     try:
-        has_usage = bool(connection.execute("PRAGMA table_info(session_model_usage)").fetchall())
+        usage_cols = {str(row[1]) for row in connection.execute("PRAGMA table_info(session_model_usage)").fetchall()}
     except Exception:
-        has_usage = False
-    overridden = set(_ACCOUNTED_TOKEN_COLUMNS) | {"api_call_count", "actual_cost_usd", "estimated_cost_usd"}
+        usage_cols = set()
+    has_usage = bool(usage_cols)
+    overridden = set(_ACCOUNTED_TOKEN_COLUMNS) | {"api_call_count", "actual_cost_usd", "estimated_cost_usd", "cost_status", "cost_source", "list_price_usd"}
     passthrough = ", ".join(f's."{column}"' for column in columns if column not in overridden)
     if not has_usage:
         return "SELECT * FROM sessions"
@@ -526,17 +666,32 @@ def _accounted_sessions_sql(connection: Any) -> str:
                 f'CASE WHEN coalesce(u."{column}",0) > coalesce(s."{column}",0) THEN u."{column}" '
                 f'ELSE s."{column}" END AS "{column}"'
             )
+    if "cost_status" in columns:
+        computed.append('CASE WHEN lower(coalesce(s."cost_status",\'\')) IN (\'\',\'unknown\') AND coalesce(u."estimated_cost_usd",0) > 0 THEN \'estimated\' WHEN lower(coalesce(s."cost_status",\'\')) IN (\'\',\'unknown\') AND coalesce(u."__inc_rows",0) > 0 AND coalesce(u."__unp_rows",0) = 0 THEN \'included\' ELSE s."cost_status" END AS "cost_status"')
+    if "cost_source" in columns:
+        computed.append('coalesce(nullif(s."cost_source",\'\'), u."cost_source") AS "cost_source"')
+    if "list_price_usd" in columns:
+        computed.append('CASE WHEN coalesce(u."list_price_usd",0) > coalesce(s."list_price_usd",0) THEN u."list_price_usd" ELSE s."list_price_usd" END AS "list_price_usd"')
+    usage_profile = "\"__profile\"" in columns and "__profile" in usage_cols
+    group_by = 'session_id, "__profile"' if usage_profile else "session_id"
+    select_profile = ', "__profile"' if usage_profile else ""
+    join_profile = ' AND u."__profile" = s."__profile"' if usage_profile else ""
+    list_price = 'SUM(CASE WHEN "list_price_usd" > 0 THEN "list_price_usd" ELSE 0 END)' if "list_price_usd" in usage_cols else "0"
+    included = "SUM(CASE WHEN lower(coalesce(\"cost_status\",'')) IN ('included','subscription','free') THEN 1 ELSE 0 END)" if "cost_status" in usage_cols else "0"
+    unpriced = "SUM(CASE WHEN coalesce(\"actual_cost_usd\",0) <= 0 AND coalesce(\"estimated_cost_usd\",0) <= 0 AND lower(coalesce(\"cost_status\",'')) NOT IN ('included','subscription','free') THEN 1 ELSE 0 END)" if "cost_status" in usage_cols else "0"
+    cost_source = 'MAX(CASE WHEN coalesce("cost_source",\'\') != \'\' THEN "cost_source" ELSE NULL END)' if "cost_source" in usage_cols else "NULL"
     usage_totals = (
-        "SELECT session_id, "
+        "SELECT session_id" + select_profile + ", "
         + ", ".join(f'SUM(coalesce("{column}",0)) AS "{column}"' for column in _ACCOUNTED_TOKEN_COLUMNS)
         + ', SUM(coalesce("api_call_count",0)) AS "api_call_count"'
         + ', SUM(CASE WHEN "actual_cost_usd" > 0 THEN "actual_cost_usd" ELSE 0 END) AS "actual_cost_usd"'
         + ', SUM(CASE WHEN "estimated_cost_usd" > 0 THEN "estimated_cost_usd" ELSE 0 END) AS "estimated_cost_usd"'
-        + " FROM session_model_usage GROUP BY session_id"
+        + f', {list_price} AS "list_price_usd", {included} AS "__inc_rows", {unpriced} AS "__unp_rows", {cost_source} AS "cost_source"'
+        + f" FROM session_model_usage GROUP BY {group_by}"
     )
     return (
         f"SELECT {passthrough}, {', '.join(computed)} FROM sessions s "
-        f"LEFT JOIN ({usage_totals}) u ON u.session_id = s.id"
+        f"LEFT JOIN ({usage_totals}) u ON u.session_id = s.id{join_profile}"
     )
 
 

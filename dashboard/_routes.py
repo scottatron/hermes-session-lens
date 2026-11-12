@@ -5,6 +5,7 @@ from __future__ import annotations
 import bisect
 
 from ._common import *
+from ._hermes_compat import _approx_model_rates, _copilot_pricing_mode
 from ._logparse import *
 from ._classify import *
 from ._reliability import *
@@ -3669,7 +3670,7 @@ def _tool_group(name: str) -> Tuple[str, str, str]:
 
 
 _CONTEXT_PRICING_TTL_SECONDS = 3600.0
-_context_pricing_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any]]] = {}
+_context_pricing_cache: Dict[Tuple[str, str, str, str], Tuple[float, Dict[str, Any]]] = {}
 _CONTEXT_SCAN_ROW_CAP = 200_000
 _CONTEXT_CHARS_PER_TOKEN = 4
 
@@ -3688,15 +3689,23 @@ def _context_pricing(
     status = str(cost_status or "").strip().lower()
     if route["subscription"] or status in {"included", "subscription", "free"} or "included" in str(billing_mode or "").lower():
         return {"kind": "included", "input_per_token": None, "cache_read_per_token": None, "source": None}
-    key = (str(model or ""), str(provider or ""), str(base_url or ""))
+    settings = _plugin_settings()
+    overrides = settings.get("model_pricing_overrides") or {}
+    override_key = json.dumps(overrides, sort_keys=True, default=str) if isinstance(overrides, dict) else str(overrides)
+    mode = _copilot_pricing_mode(settings)
+    key = (str(model or ""), str(provider or ""), str(base_url or ""), mode + ":" + override_key)
     now = time.time()
     cached = _context_pricing_cache.get(key)
     if cached and now - cached[0] < _CONTEXT_PRICING_TTL_SECONDS:
         return cached[1]
+    rates, source = _approx_model_rates(key[0], key[1] or None, key[2] or None, settings=settings)
+    if source == "user_override":
+        result = {"kind": "priced", "input_per_token": rates[0], "cache_read_per_token": rates[2], "source": source}
+        _context_pricing_cache[key] = (now, result)
+        return result
     result: Dict[str, Any] = {"kind": "unpriced", "input_per_token": None, "cache_read_per_token": None, "source": None}
     try:
         from agent.usage_pricing import get_pricing_entry
-
         entry = get_pricing_entry(key[0], key[1] or None, key[2] or None)
     except Exception:
         entry = None
@@ -3705,12 +3714,13 @@ def _context_pricing(
             result = {"kind": "included", "input_per_token": None, "cache_read_per_token": None, "source": None}
         else:
             cache_read = entry.cache_read_cost_per_million
-            result = {
-                "kind": "priced",
-                "input_per_token": float(entry.input_cost_per_million) / 1_000_000.0,
-                "cache_read_per_token": None if cache_read is None else float(cache_read) / 1_000_000.0,
-                "source": str(getattr(entry, "source", "") or "") or None,
-            }
+            result = {"kind": "priced", "input_per_token": float(entry.input_cost_per_million) / 1_000_000.0, "cache_read_per_token": None if cache_read is None else float(cache_read) / 1_000_000.0, "source": str(getattr(entry, "source", "") or "") or None}
+    if result["kind"] == "unpriced":
+        rates, source = _approx_model_rates(key[0], key[1] or None, key[2] or None, settings=settings)
+        if source == "copilot_approx" and _copilot_pricing_mode(settings) == "subscription":
+            result = {"kind": "included", "input_per_token": None, "cache_read_per_token": None, "source": None}
+        elif rates is not None:
+            result = {"kind": "priced", "input_per_token": rates[0], "cache_read_per_token": rates[2], "source": source}
     _context_pricing_cache[key] = (now, result)
     return result
 

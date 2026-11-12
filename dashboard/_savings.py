@@ -12,44 +12,42 @@ The estimate assumes the candidate caches as well as the current route —
 it is a ranking of options, not a quote.
 """
 
-from __future__ import annotations
+import json
 
 from ._common import *
+from ._hermes_compat import _approx_model_rates, _copilot_pricing_mode
 from ._watch import _is_subscription_route
 
 SAVINGS_MIN_SPEND_USD = 0.25
 SAVINGS_MIN_SHARE = 0.15
 SAVINGS_RELIABILITY_MARGIN = 0.03
 SAVINGS_MAX_ALTERNATIVES = 3
-_mix_rate_cache: Dict[Tuple[str, str], Tuple[float, Optional[Tuple[float, float, float, float]]]] = {}
+_mix_rate_cache: Dict[Tuple[Any, ...], Tuple[float, Optional[Tuple[float, float, float, float]]]] = {}
 
 
 def _mix_rates(model: str, provider: str) -> Optional[Tuple[float, float, float, float]]:
     """(input, output, cache read, cache write) USD per token, or None when Hermes has no price."""
-    key = (str(model or ""), str(provider or ""))
+    settings = _plugin_settings()
+    snapshot = json.dumps({"copilot_pricing_mode": _copilot_pricing_mode(settings), "model_pricing_overrides": settings.get("model_pricing_overrides") or {}}, sort_keys=True, separators=(",", ":"))
+    key = (str(model or ""), str(provider or ""), snapshot)
     now = time.time()
     cached = _mix_rate_cache.get(key)
     if cached and now - cached[0] < 3600:
         return cached[1]
-    rates = None
-    try:
-        from agent.usage_pricing import get_pricing_entry
-
-        entry = get_pricing_entry(key[0], key[1], None)
-    except Exception:
-        entry = None
-    input_rate = getattr(entry, "input_cost_per_million", None) if entry is not None else None
-    if input_rate is not None:
-        def per(name: str, fallback: Any) -> float:
-            value = getattr(entry, name, None)
-            return float(value if value is not None else fallback) / 1e6
-
-        rates = (
-            float(input_rate) / 1e6,
-            per("output_cost_per_million", input_rate),
-            per("cache_read_cost_per_million", input_rate),
-            per("cache_write_cost_per_million", input_rate),
-        )
+    rates, _source = _approx_model_rates(key[0], key[1], settings=settings)
+    if rates is None:
+        try:
+            from agent.usage_pricing import get_pricing_entry
+            entry = get_pricing_entry(key[0], key[1], None)
+        except Exception:
+            entry = None
+        if entry is not None and getattr(entry, "pricing_version", "") != "included-route":
+            input_rate = getattr(entry, "input_cost_per_million", None)
+            if input_rate is not None:
+                def per(name: str, fallback: Any) -> float:
+                    value = getattr(entry, name, None)
+                    return float(value if value is not None else fallback) / 1e6
+                rates = (float(input_rate) / 1e6, per("output_cost_per_million", input_rate), per("cache_read_cost_per_million", input_rate), per("cache_write_cost_per_million", input_rate))
     _mix_rate_cache[key] = (now, rates)
     return rates
 

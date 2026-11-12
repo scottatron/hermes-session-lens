@@ -26,6 +26,15 @@ config_schema:
     type: int
     default: 25
     description: "Seconds one Session Lens view may spend building its data before the backend stops it and the view shows why. Keeps Hermes responsive when a scope is too heavy. 0 disables the budget."
+  copilot_pricing_mode:
+    type: str
+    default: estimated
+    choices: [estimated, subscription, off]
+    description: "How to account for unpriced GitHub Copilot usage: estimated applies vendor API list rates as estimated USD; subscription marks usage included and records those rates as list_price_usd; off leaves Copilot unpriced."
+  model_pricing_overrides:
+    type: dict
+    default: {}
+    description: "Optional model-id or glob to {input, output, cache_read, cache_write} USD-per-1M-token rate overrides."
   anthropic_usage_probe:
     type: bool
     default: false

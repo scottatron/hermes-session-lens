@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from ._common import *
 from ._logparse import *
+from ._hermes_compat import _copilot_pricing_mode, _is_copilot_route
 
 WATCH_WINDOW_SECONDS = 3600
 WATCH_ACTIVE_SECONDS = 900
@@ -41,6 +42,8 @@ def _parse_watch_param(raw: Any) -> Dict[str, float]:
 
 def _is_subscription_route(*values: Any) -> bool:
     text = " ".join(str(value or "").lower() for value in values)
+    if _copilot_pricing_mode() == "subscription" and _is_copilot_route(*values):
+        return True
     return any(pattern.strip("%") in text for pattern in SUBSCRIPTION_ROUTE_PATTERNS)
 
 
@@ -51,36 +54,37 @@ def _call_rates(model: str, provider: str) -> Optional[Tuple[float, float, float
     Anthropic lists it, which is what Hermes itself records as the usage's
     list-price equivalent.
     """
-    key = (str(model or ""), str(provider or ""))
+    settings = _plugin_settings()
+    key = (str(model or ""), str(provider or ""), repr((_copilot_pricing_mode(settings), settings.get("model_pricing_overrides", {}))))
     now = time.time()
     cached = _watch_rate_cache.get(key)
     if cached and now - cached[0] < _WATCH_RATE_TTL_SECONDS:
         return cached[1]
     rates: Optional[Tuple[float, float, float]] = None
-    try:
-        from agent.usage_pricing import get_pricing_entry
-    except Exception:
-        get_pricing_entry = None
-    if get_pricing_entry is not None:
-        candidates = [(key[0], key[1])]
-        if _is_subscription_route(key[1]):
-            candidates += [(key[0], "anthropic"), (key[0].split("[", 1)[0], "anthropic")]
-        for candidate_model, candidate_provider in candidates:
-            try:
-                entry = get_pricing_entry(candidate_model, candidate_provider, None)
-            except Exception:
-                entry = None
-            input_rate = getattr(entry, "input_cost_per_million", None) if entry is not None else None
-            if input_rate is None:
-                continue
-            output_rate = getattr(entry, "output_cost_per_million", None)
-            cache_rate = getattr(entry, "cache_read_cost_per_million", None)
-            rates = (
-                float(input_rate) / 1e6,
-                float(output_rate if output_rate is not None else input_rate) / 1e6,
-                float(cache_rate if cache_rate is not None else input_rate) / 1e6,
-            )
-            break
+    rates4, source = _approx_model_rates(key[0], key[1], settings=settings)
+    if rates4 is not None and source in {"user_override", "copilot_approx"}:
+        rates = rates4[:3]
+    if rates is None:
+        try:
+            from agent.usage_pricing import get_pricing_entry
+        except Exception:
+            get_pricing_entry = None
+        if get_pricing_entry is not None:
+            candidates = [(key[0], key[1])]
+            if _is_subscription_route(key[1]):
+                candidates += [(key[0], "anthropic"), (key[0].split("[", 1)[0], "anthropic")]
+            for candidate_model, candidate_provider in candidates:
+                try:
+                    entry = get_pricing_entry(candidate_model, candidate_provider, None)
+                except Exception:
+                    entry = None
+                input_rate = getattr(entry, "input_cost_per_million", None) if entry is not None else None
+                if input_rate is None:
+                    continue
+                output_rate = getattr(entry, "output_cost_per_million", None)
+                cache_rate = getattr(entry, "cache_read_cost_per_million", None)
+                rates = (float(input_rate) / 1e6, float(output_rate if output_rate is not None else input_rate) / 1e6, float(cache_rate if cache_rate is not None else input_rate) / 1e6)
+                break
     _watch_rate_cache[key] = (now, rates)
     return rates
 

@@ -5062,7 +5062,7 @@ process.stdout.write(JSON.stringify(out))
             self.assertEqual(included["kind"], "included")
             unpriced = api._context_pricing("mystery/model", "custom", "http://localhost:1234/v1", "", "unknown")
             self.assertEqual(unpriced["kind"], "unpriced")
-        self.assertIn(("mystery/model", "custom", "http://localhost:1234/v1"), api._context_pricing_cache)
+        self.assertTrue(any(key[:3] == ("mystery/model", "custom", "http://localhost:1234/v1") for key in api._context_pricing_cache))
 
 
     def test_budgets_param_parsing_is_forgiving(self):
