@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from ._common import *
 from ._logparse import *
-from ._hermes_compat import _copilot_pricing_mode, _is_copilot_route
+from ._hermes_compat import _codex_pricing_mode, _copilot_pricing_mode, _is_codex_route, _is_copilot_route
 
 WATCH_WINDOW_SECONDS = 3600
 WATCH_ACTIVE_SECONDS = 900
@@ -44,6 +44,8 @@ def _is_subscription_route(*values: Any) -> bool:
     text = " ".join(str(value or "").lower() for value in values)
     if _copilot_pricing_mode() == "subscription" and _is_copilot_route(*values):
         return True
+    if _codex_pricing_mode() == "subscription" and _is_codex_route(*values):
+        return True
     return any(pattern.strip("%") in text for pattern in SUBSCRIPTION_ROUTE_PATTERNS)
 
 
@@ -55,14 +57,14 @@ def _call_rates(model: str, provider: str) -> Optional[Tuple[float, float, float
     list-price equivalent.
     """
     settings = _plugin_settings()
-    key = (str(model or ""), str(provider or ""), repr((_copilot_pricing_mode(settings), settings.get("model_pricing_overrides", {}))))
+    key = (str(model or ""), str(provider or ""), repr((_copilot_pricing_mode(settings), _codex_pricing_mode(settings), settings.get("model_pricing_overrides", {}))))
     now = time.time()
     cached = _watch_rate_cache.get(key)
     if cached and now - cached[0] < _WATCH_RATE_TTL_SECONDS:
         return cached[1]
     rates: Optional[Tuple[float, float, float]] = None
     rates4, source = _approx_model_rates(key[0], key[1], settings=settings)
-    if rates4 is not None and source in {"user_override", "copilot_approx"}:
+    if rates4 is not None and source in {"user_override", "copilot_approx", "codex_approx"}:
         rates = rates4[:3]
     if rates is None:
         try:

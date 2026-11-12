@@ -16,6 +16,40 @@ class ApproximatePricingTests(unittest.TestCase):
         self.assertEqual(source, "user_override")
         self.assertEqual(rates, (2e-6, 6e-6, 1e-6, 3e-6))
 
+    def test_codex_routes_and_fallback_models(self):
+        for route in ("openai-codex", "https://chatgpt.com/backend-api/codex", "https://chatgpt.com/backend-api/codex/"):
+            self.assertTrue(compat._is_codex_route(route))
+        for model in ("gpt-6.1-sol", "gpt-6.1-sol-900k", "gpt-6-luna", "gpt-6.1-terra", "gpt-5.3-codex", "gpt-5.2-codex", "codex-mini-latest"):
+            rates, source = compat._approx_model_rates(model, "openai-codex")
+            self.assertEqual(source, "codex_approx", model)
+            self.assertIsNotNone(rates, model)
+        rates, source = compat._approx_model_rates("gpt-5.3-codex", "openai-codex", settings={"codex_pricing_mode": "off"})
+        self.assertIsNone(rates)
+        self.assertEqual(source, "")
+        rates, source = compat._approx_model_rates("gpt-5.3-codex", "openai-codex", settings={"codex_pricing_mode": "off", "model_pricing_overrides": {"gpt-5.3-codex": [1, 2]}})
+        self.assertEqual(source, "user_override")
+        self.assertEqual(rates, (1e-6, 2e-6, 1e-6, 1e-6))
+
+    def test_codex_context_pricing_modes(self):
+        for status, settings, expected in (("", {}, "priced"), ("estimated", {}, "priced"), ("", {"codex_pricing_mode": "subscription"}, "included"), ("", {"codex_pricing_mode": "off"}, "included")):
+            routes._context_pricing_cache.clear()
+            with patch.object(routes, "_plugin_settings", return_value=settings):
+                self.assertEqual(routes._context_pricing("gpt-5.3-codex", "openai-codex", "", "subscription_included", status)["kind"], expected)
+
+    def test_standalone_fallback_without_agent_package(self):
+        with patch.dict("sys.modules", {"agent": None, "agent.usage_pricing": None}):
+            self.assertEqual(compat._approx_model_rates("gemini-4-carbon", "copilot")[1], "copilot_approx")
+            self.assertEqual(compat._approx_model_rates("gpt-5.3-codex", "openai-codex")[1], "codex_approx")
+
+    def test_watch_and_savings_codex_helpers(self):
+        from dashboard import _watch, _savings
+        with patch.object(_watch, "_codex_pricing_mode", return_value="subscription"):
+            self.assertTrue(_watch._is_subscription_route("openai-codex"))
+        with patch.object(_watch, "_plugin_settings", return_value={}):
+            self.assertIsNotNone(_watch._call_rates("gpt-5.3-codex", "openai-codex"))
+        with patch.object(_savings, "_plugin_settings", return_value={}):
+            self.assertIsNotNone(_savings._mix_rates("gpt-5.3-codex", "openai-codex"))
+
     def test_copilot_mode_off_and_override_remains_available(self):
         rates, source = compat._approx_model_rates("gpt-4.1", "copilot", settings={"copilot_pricing_mode": "off"})
         self.assertIsNone(rates)
@@ -89,6 +123,30 @@ class ApproximatePricingTests(unittest.TestCase):
                 if settings.get("copilot_pricing_mode") == "subscription":
                     usage_row = db.execute("SELECT cost_status, estimated_cost_usd, list_price_usd FROM session_model_usage").fetchone()
                     self.assertEqual(usage_row, ("included", 0, 2.0))
+                db.close()
+
+    def test_install_accounting_views_codex_modes(self):
+        import sqlite3
+        schema = """
+            CREATE TABLE sessions(id TEXT, model TEXT, billing_provider TEXT, billing_base_url TEXT, billing_mode TEXT,
+                input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+                reasoning_tokens INTEGER, api_call_count INTEGER, actual_cost_usd REAL,
+                estimated_cost_usd REAL, cost_status TEXT, cost_source TEXT, list_price_usd REAL);
+            CREATE TABLE session_model_usage(session_id TEXT, model TEXT, billing_provider TEXT,
+                billing_base_url TEXT, billing_mode TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER, reasoning_tokens INTEGER, api_call_count INTEGER,
+                actual_cost_usd REAL, estimated_cost_usd REAL, cost_status TEXT, cost_source TEXT, list_price_usd REAL);
+            INSERT INTO sessions VALUES ('s','gpt-5.3-codex','openai-codex','https://chatgpt.com/backend-api/codex','subscription_included',1000000,0,0,0,0,1,0,0,'included','none',0);
+            INSERT INTO session_model_usage VALUES ('s','gpt-5.3-codex','openai-codex','https://chatgpt.com/backend-api/codex','subscription_included',1000000,0,0,0,0,1,0,0,'included','none',0);
+        """
+        cases = (({}, ("estimated", "codex_approx", 1.75, 0.0)), ({"codex_pricing_mode": "subscription"}, ("included", "codex_approx", 0.0, 1.75)), ({"codex_pricing_mode": "off"}, ("included", "none", 0.0, 0.0)))
+        for settings, expected in cases:
+            with self.subTest(settings=settings), patch.object(compat, "_plugin_settings", return_value=settings):
+                db = sqlite3.connect(":memory:")
+                db.executescript(schema)
+                compat._install_accounting_views(db)
+                row = db.execute("SELECT cost_status, cost_source, estimated_cost_usd, list_price_usd FROM session_model_usage").fetchone()
+                self.assertEqual(row, expected)
                 db.close()
 
     def test_copilot_known_models_use_local_hermes_pricing(self):

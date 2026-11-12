@@ -15,7 +15,7 @@ it is a ranking of options, not a quote.
 import json
 
 from ._common import *
-from ._hermes_compat import _approx_model_rates, _copilot_pricing_mode
+from ._hermes_compat import _approx_model_rates, _codex_pricing_mode, _copilot_pricing_mode
 from ._watch import _is_subscription_route
 
 SAVINGS_MIN_SPEND_USD = 0.25
@@ -28,7 +28,7 @@ _mix_rate_cache: Dict[Tuple[Any, ...], Tuple[float, Optional[Tuple[float, float,
 def _mix_rates(model: str, provider: str) -> Optional[Tuple[float, float, float, float]]:
     """(input, output, cache read, cache write) USD per token, or None when Hermes has no price."""
     settings = _plugin_settings()
-    snapshot = json.dumps({"copilot_pricing_mode": _copilot_pricing_mode(settings), "model_pricing_overrides": settings.get("model_pricing_overrides") or {}}, sort_keys=True, separators=(",", ":"))
+    snapshot = json.dumps({"copilot_pricing_mode": _copilot_pricing_mode(settings), "codex_pricing_mode": _codex_pricing_mode(settings), "model_pricing_overrides": settings.get("model_pricing_overrides") or {}}, sort_keys=True, separators=(",", ":"))
     key = (str(model or ""), str(provider or ""), snapshot)
     now = time.time()
     cached = _mix_rate_cache.get(key)

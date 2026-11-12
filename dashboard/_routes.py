@@ -5,7 +5,7 @@ from __future__ import annotations
 import bisect
 
 from ._common import *
-from ._hermes_compat import _approx_model_rates, _copilot_pricing_mode
+from ._hermes_compat import _approx_model_rates, _codex_pricing_mode, _copilot_pricing_mode
 from ._logparse import *
 from ._classify import *
 from ._reliability import *
@@ -2984,7 +2984,7 @@ def _ai_models_payload_sync(
         model["cost_usd"] += row_cost
         model["actual_cost"] = bool(model["actual_cost"] or row_cost_kind == "actual")
         model["estimated_cost"] = bool(model["estimated_cost"] or row_cost_kind == "estimated")
-        model["included_cost"] = bool(model["included_cost"] or route["subscription"])
+        model["included_cost"] = bool(model["included_cost"] or (route["subscription"] and row_cost_kind != "estimated"))
         model["free_api_cost"] = bool(
             model["free_api_cost"]
             or (not route["subscription"] and row_cost_kind == "included")
@@ -3293,12 +3293,10 @@ def _ai_models_payload_sync(
             cache_tokens = None
             cache_coverage = "unavailable"
 
-        included = bool(model.pop("included_cost")) or any(
-            bool(route.get("subscription")) for route in routes
-        )
-        free_api = bool(model.pop("free_api_cost"))
         actual = bool(model.pop("actual_cost"))
         estimated = bool(model.pop("estimated_cost"))
+        free_api = bool(model.pop("free_api_cost"))
+        included = bool(model.pop("included_cost")) or (not estimated and any(bool(route.get("subscription")) for route in routes))
         has_metered_cost = model["cost_usd"] > 0
         if included and has_metered_cost:
             cost_kind = "mixed"
@@ -3687,20 +3685,27 @@ def _context_pricing(
     """
     route = _route_descriptor(provider, base_url, billing_mode)
     status = str(cost_status or "").strip().lower()
-    if route["subscription"] or status in {"included", "subscription", "free"} or "included" in str(billing_mode or "").lower():
+    if status in {"included", "subscription", "free"}:
         return {"kind": "included", "input_per_token": None, "cache_read_per_token": None, "source": None}
     settings = _plugin_settings()
     overrides = settings.get("model_pricing_overrides") or {}
     override_key = json.dumps(overrides, sort_keys=True, default=str) if isinstance(overrides, dict) else str(overrides)
-    mode = _copilot_pricing_mode(settings)
-    key = (str(model or ""), str(provider or ""), str(base_url or ""), mode + ":" + override_key)
+    key = (str(model or ""), str(provider or ""), str(base_url or ""), _copilot_pricing_mode(settings) + ":" + _codex_pricing_mode(settings) + ":" + override_key)
     now = time.time()
     cached = _context_pricing_cache.get(key)
     if cached and now - cached[0] < _CONTEXT_PRICING_TTL_SECONDS:
         return cached[1]
-    rates, source = _approx_model_rates(key[0], key[1] or None, key[2] or None, settings=settings)
-    if source == "user_override":
-        result = {"kind": "priced", "input_per_token": rates[0], "cache_read_per_token": rates[2], "source": source}
+    rates, approx_source = _approx_model_rates(key[0], key[1] or None, key[2] or None, settings=settings)
+    if approx_source == "user_override" and rates is not None:
+        result = {"kind": "priced", "input_per_token": rates[0], "cache_read_per_token": rates[2], "source": approx_source}
+        _context_pricing_cache[key] = (now, result)
+        return result
+    if (approx_source == "codex_approx" and _codex_pricing_mode(settings) == "estimated" and rates is not None) or (approx_source == "copilot_approx" and _copilot_pricing_mode(settings) == "estimated" and rates is not None and (route["subscription"] or "included" in str(billing_mode or "").lower())):
+        result = {"kind": "priced", "input_per_token": rates[0], "cache_read_per_token": rates[2], "source": approx_source}
+        _context_pricing_cache[key] = (now, result)
+        return result
+    if route["subscription"] or "included" in str(billing_mode or "").lower():
+        result = {"kind": "included", "input_per_token": None, "cache_read_per_token": None, "source": None}
         _context_pricing_cache[key] = (now, result)
         return result
     result: Dict[str, Any] = {"kind": "unpriced", "input_per_token": None, "cache_read_per_token": None, "source": None}
@@ -3716,11 +3721,11 @@ def _context_pricing(
             cache_read = entry.cache_read_cost_per_million
             result = {"kind": "priced", "input_per_token": float(entry.input_cost_per_million) / 1_000_000.0, "cache_read_per_token": None if cache_read is None else float(cache_read) / 1_000_000.0, "source": str(getattr(entry, "source", "") or "") or None}
     if result["kind"] == "unpriced":
-        rates, source = _approx_model_rates(key[0], key[1] or None, key[2] or None, settings=settings)
-        if source == "copilot_approx" and _copilot_pricing_mode(settings) == "subscription":
+        rates, approx_source = _approx_model_rates(key[0], key[1] or None, key[2] or None, settings=settings)
+        if (approx_source == "copilot_approx" and _copilot_pricing_mode(settings) == "subscription") or (approx_source == "codex_approx" and _codex_pricing_mode(settings) == "subscription"):
             result = {"kind": "included", "input_per_token": None, "cache_read_per_token": None, "source": None}
         elif rates is not None:
-            result = {"kind": "priced", "input_per_token": rates[0], "cache_read_per_token": rates[2], "source": source}
+            result = {"kind": "priced", "input_per_token": rates[0], "cache_read_per_token": rates[2], "source": approx_source}
     _context_pricing_cache[key] = (now, result)
     return result
 

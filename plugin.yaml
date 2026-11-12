@@ -31,6 +31,11 @@ config_schema:
     default: estimated
     choices: [estimated, subscription, off]
     description: "How to account for unpriced GitHub Copilot usage: estimated applies vendor API list rates as estimated USD; subscription marks usage included and records those rates as list_price_usd; off leaves Copilot unpriced."
+  codex_pricing_mode:
+    type: str
+    default: estimated
+    choices: [estimated, subscription, off]
+    description: "How to account for OpenAI Codex OAuth usage recorded in Hermes: estimated applies OpenAI API list rates as estimated USD; subscription keeps usage included and records those rates as list_price_usd; off leaves Codex usage as recorded."
   model_pricing_overrides:
     type: dict
     default: {}
